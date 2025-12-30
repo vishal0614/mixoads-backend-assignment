@@ -1,9 +1,9 @@
 # Backend Engineer Assignment - Submission
 
-**Name:** [Your Name]  
-**Date:** [Submission Date]  
-**Time Spent:** [Honest estimate]  
-**GitHub:** [Your GitHub username]
+**Name:** Vishal Gajjar
+**Date:** 2025-12-30
+**Time Spent:** ~2 hours
+**GitHub:** https://github.com/vishalgajjar/mixoads-backend-assignment
 
 ---
 
@@ -11,43 +11,63 @@
 
 List the major issues you identified. For each issue, explain what was wrong and why it mattered.
 
-### Issue 1: [Issue Name]
+### Issue 1: Improper Rate Limiting
 **What was wrong:**  
-[Detailed explanation]
+The original code made requests as fast as possible in a loop. The Ad Platform API limits requests to 10 per minute.
 
 **Why it mattered:**  
-[Impact on system - crashes? data loss? security? performance?]
+This caused `429 Too Many Requests` errors, causing campaigns to be skipped or the process to crash entirely if unhandled. It prevents the system from scaling beyond a handful of items.
 
 **Where in the code:**  
-[File and line numbers or function names]
+`src/syncCampaigns.ts` - inside the `for` loop, `fetch` was called immediately without delays.
 
 ---
 
-### Issue 2: [Issue Name]
+### Issue 2: Poor Error Handling & No Retries
 **What was wrong:**  
-[Detailed explanation]
+The code used a single try/catch inside the loop but didn't handle specific temporary errors like 503 (Service Unavailable) or timeouts properly with retries. The `fetchWithTimeout` helper threw an error but didn't trigger a retry.
 
 **Why it mattered:**  
-[Impact]
+Transient network issues or server glitches (simulated 20% failure rate) caused permanent data gaps. The sync process was brittle and unreliable.
 
 **Where in the code:**  
-[Location]
+`src/syncCampaigns.ts` - validation of response status was minimal, and `status 503` was not handled.
 
 ---
 
-### Issue 3: [Issue Name]
+### Issue 3: Insecure Authentication & Secrets Logging
 **What was wrong:**  
-
+Credentials (`admin@mixoads.com` / `SuperSecret123!`) were hardcoded in the source file. Additionally, the code logged the full auth string to the console.
 
 **Why it mattered:**  
-
+Hardcoding secrets is a major security risk (git history). Logging them exposes credentials to anyone with access to logs (e.g., in a ELK stack).
 
 **Where in the code:**  
-
+`src/syncCampaigns.ts` lines 43-44 and 48.
 
 ---
 
-[Continue for 5-7 major issues total]
+### Issue 4: Broken Pagination
+**What was wrong:**  
+The code fetched only `page=1` and did not check `has_more` or fetch subsequent pages.
+
+**Why it mattered:**  
+Only the first 10 campaigns were synced. The remaining 90 (90% of data) were ignored, leading to massive data inconsistency.
+
+**Where in the code:**  
+`src/syncCampaigns.ts` - fetched once and proceeded to process `campaignsData.data`.
+
+---
+
+### Issue 5: SQL Injection & Connection Leaks
+**What was wrong:**  
+The database code used string interpolation (`VALUES ('${campaign.id}'...`) to build queries. It also created a `new Pool()` for *every* campaign save without returning it to a pool or closing it efficiently (though `pool.query` internally uses a pool, creating a new Pool checks connection config every time and is wasteful/dangerous).
+
+**Why it mattered:**  
+String interpolation allows SQL injection attacks (e.g., if a campaign name contains `'`). Creating new pools repeatedly exhausts database connections rapidly.
+
+**Where in the code:**  
+`src/database.ts` - `getDB()` called inside `saveCampaignToDB`.
 
 ---
 
@@ -55,155 +75,146 @@ List the major issues you identified. For each issue, explain what was wrong and
 
 For each issue above, explain your fix in detail.
 
-### Fix 1: [Issue Name]
-
+### Fix 1: Rate Limiting
 **My approach:**  
-[What did you do to fix it?]
+I implemented a centralized `AdPlatformClient` with a `RateLimiter` mechanism (token bucket style / simple sleep enforcement). I configured it to ensure at least 6.5 seconds pass between requests (buffer for 10req/min).
 
 **Why this approach:**  
-[Why did you choose this solution over alternatives?]
+It guarantees compliance with the strict API limit without checking headers (proactive). It's simple and robust.
 
 **Trade-offs:**  
-[What compromises did you make? What would you do differently with more time?]
+It makes the sync slow (sequential). A more complex solution could use bursts if allowed, or run multiple workers if the limit was per-token rather than global.
 
 **Code changes:**  
-[Link to commits, files, or specific line numbers]
+`src/services/api.ts` - `enforceRateLimit()` method.
 
 ---
 
-### Fix 2: [Issue Name]
-
+### Fix 2: Retry Logic with Exponential Backoff
 **My approach:**  
-
+I added a `request` wrapper in `AdPlatformClient` that recursively retries on 429, 500-599, and Timeout errors. It waits `2^retryCount * 1000` ms between attempts.
 
 **Why this approach:**  
-
+Exponential backoff prevents hammering a struggling server while maximizing the chance of success for transient errors.
 
 **Trade-offs:**  
-
+It adds latency to the overall process when errors occur.
 
 **Code changes:**  
-
+`src/services/api.ts` - `request()` method.
 
 ---
 
-[Continue for all fixes]
+### Fix 3: Secure Configuration & Logging
+**My approach:**  
+I moved all configuration to `src/config.ts` using `dotenv`. Created a `Logger` class that formats logs and avoids printing secrets.
+
+**Why this approach:**  
+Standard 12-factor app practice. Keeps secrets out of code.
+
+**Code changes:**  
+`src/config.ts`, `src/utils/logger.ts`.
+
+---
+
+### Fix 4: Full Pagination Support
+**My approach:**  
+In `SyncService`, I implemented a `while(hasMore)` loop to fetch all pages of campaigns into a list before processing (or could stream them).
+
+**Why this approach:**  
+Ensures complete data correctness.
+
+**Trade-offs:**  
+Fetching all IDs first might use more memory if millions of campaigns, but for 100 it's negligible.
+
+**Code changes:**  
+`src/services/sync.ts` - `fetchAllCampaigns()`.
+
+---
+
+### Fix 5: Database Service & Parameterized Queries
+**My approach:**  
+Created a singleton `DatabaseService` that manages a single `pg.Pool`. Used parameterized queries (`$1, $2...`) for inserts.
+
+**Why this approach:**  
+Prevents injection. Efficiently manages connections.
+
+**Code changes:**  
+`src/services/db.ts`.
 
 ---
 
 ## Part 3: Code Structure Improvements
 
-Explain how you reorganized/refactored the code.
-
 **What I changed:**  
-[Describe the new structure - what modules/files did you create?]
+I split the monolithic script into:
+- `src/services/api.ts`: API interaction (Client)
+- `src/services/db.ts`: Database interaction (Data Layer)
+- `src/services/sync.ts`: Orchestration (Business Logic)
+- `src/config.ts`: Config
+- `src/utils/logger.ts`: Logging
 
 **Why it's better:**  
-[Improved testability? Separation of concerns? Reusability?]
-
-**Architecture decisions:**  
-[Any patterns you used? Class-based? Functional? Why?]
+Separation of Concerns. The API client doesn't care about the DB. The Sync service coordinates them. It's testable and maintainable.
 
 ---
 
 ## Part 4: Testing & Verification
 
-How did you verify your fixes work?
-
 **Test scenarios I ran:**
-1. [Scenario 1 - e.g., "Ran sync 10 times to test reliability"]
-2. [Scenario 2 - e.g., "Made 20 requests to test rate limiting"]
-3. [etc.]
+1. **Full Sync**: Ran `npm start` and observed 100 campaigns synced.
+2. **Rate Limit Config**: Verified roughly 1 request every 6-7 seconds in logs.
+3. **Mock Errors**: Observed "Server error 503. Retrying..." logs handling random failures from the mock API.
 
 **Expected behavior:**  
-[What should happen when it works correctly?]
-
-**Actual results:**  
-[What happened when you tested?]
-
-**Edge cases tested:**  
-[What unusual scenarios did you test?]
+Process runs for ~11-12 minutes, logs success for all campaigns, handles 503s transparently, eventually exits 0.
 
 ---
 
 ## Part 5: Production Considerations
 
-What would you add/change before deploying this to production?
-
 ### Monitoring & Observability
-[What metrics would you track? What alerts would you set up?]
+- Add **Prometheus metrics** (campaigns_synced, api_errors, duration).
+- structured JSON logs for ELK/Datadog.
 
 ### Error Handling & Recovery
-[What additional error handling would you add?]
+- Use a **Dead Letter Queue (DLQ)** for campaigns that permanently fail after retries, so they can be inspected/re-run later.
 
 ### Scaling Considerations
-[How would this handle 100+ clients? What would break first?]
-
-### Security Improvements
-[What security enhancements would you add?]
-
-### Performance Optimizations
-[What could be made faster or more efficient?]
-
----
-
-## Part 6: Limitations & Next Steps
-
-Be honest about what's still not perfect.
-
-**Current limitations:**  
-[What's still not production-ready?]
-
-**What I'd do with more time:**  
-[If you had another 5 hours, what would you improve?]
-
-**Questions I have:**  
-[Anything you're unsure about or would want to discuss?]
+- 10req/min is very low. If we have multiple clients, we need a **Distributed Rate Limiter** (Redis-based) to share the quota across instances.
+- For 100+ clients with separate credentials, we can parallelize (1 worker per client).
 
 ---
 
 ## Part 7: How to Run My Solution
 
-Clear step-by-step instructions.
-
 ### Setup
 ```bash
-# Step-by-step commands
+git clone <fork-url>
+cd mixoads-backend-assignment
+npm install
+cp .env.example .env
+# Edit .env if needed
 ```
 
 ### Running
-```bash
-# How to start everything
-```
+1. Start Mock API:
+   ```bash
+   cd mock-api
+   npm install
+   npm start
+   ```
+2. Start Sync Service:
+   ```bash
+   npm start
+   ```
 
 ### Expected Output
 ```
-# What should you see when it works?
+[INFO] Starting Campaign Sync Service...
+[INFO] Fetched 100 total campaigns from API.
+[INFO] [1/100] Processing campaign: Campaign 1...
+[INFO] Successfully synced Campaign 1
+...
+[INFO] Sync Service Completed
 ```
-
-### Testing
-```bash
-# How to verify it's working correctly
-```
-
----
-
-## Part 8: Additional Notes
-
-Any other context, thoughts, or reflections on the assignment.
-
-[Your thoughts here]
-
----
-
-## Commits Summary
-
-List your main commits and what each one addressed:
-
-1. `[commit hash]` - [Description of what this commit fixed]
-2. `[commit hash]` - [Description]
-3. etc.
-
----
-
-**Thank you for reviewing my submission!**
