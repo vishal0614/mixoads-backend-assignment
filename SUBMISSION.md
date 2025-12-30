@@ -3,7 +3,7 @@
 **Name:** Vishal Gajjar
 **Date:** 2025-12-30
 **Time Spent:** ~2 hours
-**GitHub:** https://github.com/vishalgajjar/mixoads-backend-assignment
+**GitHub:** https://github.com/vishal0614/mixoads-backend-assignment
 
 ---
 
